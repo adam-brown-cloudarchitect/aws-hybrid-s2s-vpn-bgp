@@ -1,0 +1,36 @@
+v0.1 VM-Series session evidence
+Captured: 2026-11-11
+
+Router source: 172.16.100.1
+App destination: 10.100.11.178
+
+Ping command:
+ping -I 172.16.100.1 -c 120 10.100.11.178
+
+Ping summary:
+120 packets transmitted, 120 received, 0% packet loss, time 119154ms
+rtt min/avg/max/mdev = 20.263/20.597/26.377/0.687 ms
+
+Firewall us-west-1a
+Management IP: 13.52.53.44
+PAN-OS prompt host: ip-10-0-1-195
+
+Command:
+show session all filter source 172.16.100.1
+
+Matching active sessions observed for the App ping:
+2531  ping  ACTIVE  FLOW  172.16.100.1[2591]/trust/1  -> 10.100.11.178[2]/trust
+2530  ping  ACTIVE  FLOW  172.16.100.1[2591]/trust/1  -> 10.100.11.178[1]/trust
+2533  ping  ACTIVE  FLOW  172.16.100.1[2591]/trust/1  -> 10.100.11.178[3]/trust
+
+Firewall us-west-1c
+Management IP: 52.8.156.95
+PAN-OS prompt host: ip-10-0-2-25
+
+Command:
+show session all filter source 172.16.100.1
+
+Result:
+No Active Sessions
+
+Interpretation: during this test, the matching App flow was observed on the us-west-1a firewall and not on the us-west-1c firewall. This does not mean the second firewall is inactive.

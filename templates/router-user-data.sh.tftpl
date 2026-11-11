@@ -1,0 +1,207 @@
+#!/bin/bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y strongswan strongswan-swanctl frr iproute2 curl
+
+cat >/etc/sysctl.d/90-p2-vpn-router.conf <<'SYSCTL'
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+SYSCTL
+sysctl --system
+
+cat >/etc/strongswan.d/charon/90-vti.conf <<'STRONGSWAN'
+charon {
+  install_routes = no
+}
+STRONGSWAN
+
+cat >/usr/local/sbin/configure-vpn-interfaces <<'CONFIGURE'
+#!/bin/bash
+set -euo pipefail
+
+TOKEN="$(curl --fail --silent --show-error --request PUT \
+  --header "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+  http://169.254.169.254/latest/api/token)"
+LOCAL_IP="$(curl --fail --silent --show-error \
+  --header "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/local-ipv4)"
+WAN_IFACE="$(ip -o route show default | awk '{print $5; exit}')"
+
+sysctl -w "net.ipv4.conf.$WAN_IFACE.disable_xfrm=1"
+sysctl -w "net.ipv4.conf.$WAN_IFACE.disable_policy=1"
+
+ip link show dummy0 >/dev/null 2>&1 || ip link add dummy0 type dummy
+ip address replace 172.16.100.1/24 dev dummy0
+ip link set dummy0 up
+
+setup_vti() {
+  local name="$1"
+  local remote="$2"
+  local inside="$3"
+  local key="$4"
+
+  if ! ip link show "$name" >/dev/null 2>&1; then
+    ip tunnel add "$name" mode vti local "$LOCAL_IP" remote "$remote" key "$key"
+  fi
+  ip address replace "$inside/30" dev "$name"
+  ip link set "$name" mtu 1436 up
+  sysctl -w "net.ipv4.conf.$name.disable_policy=1"
+  sysctl -w "net.ipv4.conf.$name.rp_filter=0"
+}
+
+setup_vti vti1 "${tunnel1_address}" "${tunnel1_cgw_inside_address}" 100
+setup_vti vti2 "${tunnel2_address}" "${tunnel2_cgw_inside_address}" 200
+
+ip route replace 10.100.0.0/16 dev vti1 scope link metric 100
+ip route replace 10.100.0.0/16 dev vti2 scope link metric 200
+ip route replace 10.200.0.0/16 dev vti1 scope link metric 100
+ip route replace 10.200.0.0/16 dev vti2 scope link metric 200
+
+if ! ip rule show | grep -Fq "100: from 172.16.0.0/16 lookup main"; then
+  ip rule add priority 100 from 172.16.0.0/16 lookup main
+fi
+CONFIGURE
+chmod 0755 /usr/local/sbin/configure-vpn-interfaces
+
+cat >/etc/systemd/system/p2-vpn-interfaces.service <<'UNIT'
+[Unit]
+Description=Configure simulated on-prem VPN interfaces and routes
+Wants=network-online.target
+After=network-online.target
+Before=strongswan-starter.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/configure-vpn-interfaces
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat >/etc/swanctl/swanctl.conf <<'SWAN'
+connections {
+  tunnel1 {
+    version = 2
+    local_addrs = %any
+    remote_addrs = ${tunnel1_address}
+    proposals = aes256-sha256-modp2048
+    rekey_time = 8h
+    dpd_delay = 10s
+
+    local {
+      auth = psk
+      id = ${customer_gateway_public_ip}
+    }
+
+    remote {
+      auth = psk
+      id = ${tunnel1_address}
+    }
+
+    children {
+      tunnel1 {
+        local_ts = 0.0.0.0/0
+        remote_ts = 0.0.0.0/0
+        esp_proposals = aes256-sha256-modp2048
+        rekey_time = 1h
+        start_action = start
+        dpd_action = restart
+        mark_in = 100
+        mark_out = 100
+      }
+    }
+  }
+
+  tunnel2 {
+    version = 2
+    local_addrs = %any
+    remote_addrs = ${tunnel2_address}
+    proposals = aes256-sha256-modp2048
+    rekey_time = 8h
+    dpd_delay = 10s
+
+    local {
+      auth = psk
+      id = ${customer_gateway_public_ip}
+    }
+
+    remote {
+      auth = psk
+      id = ${tunnel2_address}
+    }
+
+    children {
+      tunnel2 {
+        local_ts = 0.0.0.0/0
+        remote_ts = 0.0.0.0/0
+        esp_proposals = aes256-sha256-modp2048
+        rekey_time = 1h
+        start_action = start
+        dpd_action = restart
+        mark_in = 200
+        mark_out = 200
+      }
+    }
+  }
+}
+
+secrets {
+  ike-tunnel1 {
+    id-1 = ${customer_gateway_public_ip}
+    id-2 = ${tunnel1_address}
+    secret = "${tunnel1_preshared_key}"
+  }
+
+  ike-tunnel2 {
+    id-1 = ${customer_gateway_public_ip}
+    id-2 = ${tunnel2_address}
+    secret = "${tunnel2_preshared_key}"
+  }
+}
+SWAN
+chmod 0600 /etc/swanctl/swanctl.conf
+
+cat >/etc/systemd/system/p2-swanctl.service <<'UNIT'
+[Unit]
+Description=Load and initiate on-prem Site-to-Site VPN tunnels
+Requires=strongswan-starter.service p2-vpn-interfaces.service
+After=network-online.target strongswan-starter.service p2-vpn-interfaces.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/swanctl --load-all
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now p2-vpn-interfaces.service
+
+EXPECTED_EIP="${customer_gateway_public_ip}"
+TOKEN="$(curl --fail --silent --show-error --request PUT \
+  --header "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+  http://169.254.169.254/latest/api/token)"
+for attempt in $(seq 1 120); do
+  CURRENT_PUBLIC_IP="$(curl --fail --silent \
+    --header "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)"
+  if [ "$CURRENT_PUBLIC_IP" = "$EXPECTED_EIP" ]; then
+    break
+  fi
+  sleep 5
+done
+if [ "$CURRENT_PUBLIC_IP" != "$EXPECTED_EIP" ]; then
+  echo "Timed out waiting for the router Elastic IP association" >&2
+  exit 1
+fi
+
+systemctl enable --now strongswan-starter.service
+systemctl enable --now p2-swanctl.service
